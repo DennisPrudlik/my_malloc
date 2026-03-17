@@ -3,13 +3,16 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <sys/mman.h>
 
 // ── globals ────────────────────────────────────────────────────────────────
 
-static block_meta*  heap_head              = nullptr;
-static block_meta*  heap_tail              = nullptr;
-static block_meta*  free_lists[NUM_CLASSES] = {};
-static alloc_stats  g_stats                = {};
+static block_meta*     heap_head              = nullptr;
+static block_meta*     heap_tail              = nullptr;
+static block_meta*     free_lists[NUM_CLASSES] = {};
+static alloc_stats     g_stats                = {};
+static pthread_mutex_t g_heap_lock            = PTHREAD_MUTEX_INITIALIZER;
 
 // ── size class helpers ─────────────────────────────────────────────────────
 
@@ -29,16 +32,41 @@ static bool check_canary(const block_meta* blk) {
     return *(const uint64_t*)((const uint8_t*)(blk + 1) + blk_size(blk)) == CANARY_VALUE;
 }
 
+// ── randomised insertion RNG ───────────────────────────────────────────────
+// xorshift64: fast, lock-free quality good enough for heap layout shuffling.
+// g_heap_lock is always held when fl_insert is called, so no atomic needed.
+
+#define FL_RAND_DEPTH  8   // max position offset for randomised insertion
+
+static uint64_t g_rand_state = 0x9E3779B97F4A7C15ULL;  // golden-ratio seed
+
+static uint64_t next_rand() {
+    g_rand_state ^= g_rand_state << 13;
+    g_rand_state ^= g_rand_state >> 7;
+    g_rand_state ^= g_rand_state << 17;
+    return g_rand_state;
+}
+
 // ── doubly-linked free list operations ────────────────────────────────────
 
 static void fl_insert(block_meta* blk) {
     int cls = get_size_class(blk_size(blk));
     blk->size |= 1;                          // mark free (bit 0)
-    blk->free_next = free_lists[cls];
-    blk->free_prev = nullptr;
-    if (free_lists[cls])
-        free_lists[cls]->free_prev = blk;
-    free_lists[cls] = blk;
+
+    // Randomise the insertion position within [0, FL_RAND_DEPTH) so the
+    // heap layout is non-deterministic.  This defeats heap-spray attacks
+    // that rely on a predictable free-list order.
+    uint32_t offset = (uint32_t)(next_rand() % FL_RAND_DEPTH);
+
+    block_meta* prev = nullptr;
+    block_meta* cur  = free_lists[cls];
+    for (uint32_t i = 0; i < offset && cur; i++, prev = cur, cur = cur->free_next) {}
+
+    blk->free_next = cur;
+    blk->free_prev = prev;
+    if (cur)  cur->free_prev  = blk;
+    if (prev) prev->free_next = blk;
+    else      free_lists[cls] = blk;
 }
 
 static void fl_remove(block_meta* blk) {
@@ -51,6 +79,51 @@ static void fl_remove(block_meta* blk) {
         blk->free_next->free_prev = blk->free_prev;
     blk->free_next = blk->free_prev = nullptr;
 }
+
+// ── per-thread cache ───────────────────────────────────────────────────────
+// Classes 0..TCACHE_MAX_CLASS-1 (≤ 1024 B, the no-coalesce zone) get a
+// per-thread LIFO stack of up to TCACHE_BIN_MAX blocks.  Alloc pops and free
+// pushes without touching g_heap_lock — the common small-alloc path is fully
+// lock-free.  When a bin fills up, half its blocks are flushed to the global
+// free list under g_heap_lock.  The TCache destructor drains all bins on thread
+// exit (including program exit for the main thread).
+//
+// Hot statistics (num_allocs, num_frees, current_usage, total_allocated,
+// peak_usage) are updated via __atomic builtins so both the lock-free TLS path
+// and the locked slow path remain consistent without requiring an extra lock.
+
+#define TCACHE_MAX_CLASS  8    // classes 0–7  (max payload ≤ 1024 B)
+#define TCACHE_BIN_MAX   32   // max cached blocks per class per thread
+
+struct TCache {
+    struct Bin {
+        block_meta* head  = nullptr;
+        int         count = 0;
+    };
+    Bin bins[TCACHE_MAX_CLASS];
+    ~TCache();
+    void flush_bin(int cls, int n);
+};
+
+void TCache::flush_bin(int cls, int n) {
+    Bin& bin = bins[cls];
+    pthread_mutex_lock(&g_heap_lock);
+    for (int i = 0; i < n && bin.head; i++) {
+        block_meta* blk = bin.head;
+        bin.head = blk->free_next;
+        bin.count--;
+        blk->free_next = blk->free_prev = nullptr;
+        fl_insert(blk);
+    }
+    pthread_mutex_unlock(&g_heap_lock);
+}
+
+TCache::~TCache() {
+    for (int cls = 0; cls < TCACHE_MAX_CLASS; cls++)
+        flush_bin(cls, bins[cls].count);
+}
+
+static thread_local TCache tls_cache;
 
 // ── physical heap list helpers ─────────────────────────────────────────────
 
@@ -70,6 +143,7 @@ static block_meta* request_block(size_t size) {
         return nullptr;
     blk_set_size_used(blk, size);            // size stored, free flag = 0
     blk->free_next = blk->free_prev = nullptr;
+    blk->magic = MAGIC_ALLOC;
     heap_append(blk);
     write_canary(blk);
     g_stats.num_sbrk_calls++;
@@ -86,6 +160,7 @@ static block_meta* split_or_take(block_meta* blk, size_t size) {
         block_meta* rest = (block_meta*)((uint8_t*)(blk + 1) + size + CANARY_SIZE);
         blk_set_size_free(rest, leftover);   // leftover size + free flag
         rest->free_next = rest->free_prev = nullptr;
+        rest->magic = MAGIC_FREE;
 
         rest->heap_prev = blk;
         rest->heap_next = blk->heap_next;
@@ -94,6 +169,7 @@ static block_meta* split_or_take(block_meta* blk, size_t size) {
         blk->heap_next = rest;
 
         blk_set_size_used(blk, size);        // exact size, free flag cleared
+        blk->magic = MAGIC_ALLOC;
         write_canary(blk);
         write_canary(rest);
         fl_insert(rest);
@@ -106,10 +182,11 @@ static block_meta* split_or_take(block_meta* blk, size_t size) {
 
 static block_meta* fl_find(int cls, size_t size) {
     // 1. Exact small/medium class — O(1) pop.
-    //    All blocks in a small/medium class have the same capacity (CLASS_MAX[cls]),
-    //    so any block from that list satisfies the request without a size check.
-    //    LARGE_CLASS blocks have variable sizes and must not be popped blindly.
-    if (cls < LARGE_CLASS && free_lists[cls]) {
+    //    Blocks in a small/medium free list have sizes in (CLASS_MAX[cls-1], CLASS_MAX[cls]].
+    //    A rest block from a previous split may have size < CLASS_MAX[cls], so we must
+    //    verify the block is at least 'size' bytes before using it.  Inflating the
+    //    recorded size past the physical block extent corrupts adjacent free blocks.
+    if (cls < LARGE_CLASS && free_lists[cls] && blk_size(free_lists[cls]) >= size) {
         block_meta* blk = free_lists[cls];
         fl_remove(blk);
         return blk;
@@ -158,67 +235,111 @@ static block_meta* try_wilderness(size_t size) {
     return blk;
 }
 
+// ── mmap allocator ─────────────────────────────────────────────────────────
+// Requests at or above MMAP_THRESHOLD bypass the sbrk heap entirely.
+// Each block is a private anonymous mapping of exactly the right size; freeing
+// it calls munmap, returning the pages to the OS immediately.  mmap blocks are
+// NOT inserted into the heap chain (heap_next/heap_prev are null).
+
+static block_meta* mmap_alloc(size_t size) {
+    size_t total = sizeof(block_meta) + size + CANARY_SIZE;
+    void* p = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    block_meta* blk = (block_meta*)p;
+    blk->heap_next = blk->heap_prev = nullptr;
+    blk->free_next = blk->free_prev = nullptr;
+    blk_set_size_mmap(blk, size);   // bit 1 = mmap flag; bit 0 = 0 (used)
+    blk->magic = MAGIC_ALLOC;
+    write_canary(blk);
+    g_stats.num_mmap_calls++;
+    return blk;
+}
+
 // ── stat helpers ───────────────────────────────────────────────────────────
 
 static void record_alloc(size_t size) {
-    g_stats.num_allocs++;
-    g_stats.total_allocated += size;
-    g_stats.current_usage   += size;
-    if (g_stats.current_usage > g_stats.peak_usage)
-        g_stats.peak_usage = g_stats.current_usage;
+    __atomic_fetch_add(&g_stats.num_allocs,      1,    __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_stats.total_allocated, size, __ATOMIC_RELAXED);
+    size_t usage = __atomic_add_fetch(&g_stats.current_usage, size, __ATOMIC_RELAXED);
+    // Update peak via CAS; benign races only ever make peak larger.
+    size_t peak = __atomic_load_n(&g_stats.peak_usage, __ATOMIC_RELAXED);
+    while (usage > peak) {
+        if (__atomic_compare_exchange_n(&g_stats.peak_usage, &peak, usage,
+                                        /*weak=*/true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            break;
+    }
 }
 
-// ── public API ─────────────────────────────────────────────────────────────
+// ── lock-free internal implementations ────────────────────────────────────
+// All internal helpers already operate without locking.  These two functions
+// contain the full malloc/free logic and are called either from the locked
+// public API or from my_realloc which holds the lock itself.
 
-void* my_malloc(size_t size) {
+static void* malloc_unlocked(size_t size) {
     if (size == 0) return nullptr;
     size = ALIGN(size);
+
+    // Large requests bypass the sbrk heap: map private pages, free with munmap.
+    if (size >= MMAP_THRESHOLD) {
+        block_meta* blk = mmap_alloc(size);
+        if (!blk) return nullptr;
+        record_alloc(size);
+        return (void*)(blk + 1);
+    }
 
     int cls = get_size_class(size);
     if (cls < LARGE_CLASS) size = CLASS_MAX[cls];
 
     block_meta* blk = fl_find(cls, size);
-
     if (!blk) blk = try_wilderness(size);
-
     if (!blk) blk = request_block(size);
-
     if (!blk) return nullptr;
 
-    blk_set_size_used(blk, size);            // pin to requested size + clear free flag
-    write_canary(blk);                       // canary lands at user+size, not at a larger block's offset
+    blk_set_size_used(blk, size);
+    blk->magic = MAGIC_ALLOC;
+    write_canary(blk);
     record_alloc(size);
     return (void*)(blk + 1);
 }
 
-void my_free(void* ptr) {
+static void free_unlocked(void* ptr) {
     if (!ptr) return;
 
     block_meta* blk = (block_meta*)ptr - 1;
 
-    // ── guard band check ──────────────────────────────────────────────────
     if (!check_canary(blk)) {
         fprintf(stderr,
-                "[my_malloc] HEAP CORRUPTION at %p: canary overwritten "
+                "[my_malloc] HEAP CORRUPTION at %p (blk_size=%zu): canary overwritten "
                 "(expected 0x%016llX, got 0x%016llX)\n",
-                ptr,
+                ptr, blk_size(blk),
                 (unsigned long long)CANARY_VALUE,
                 (unsigned long long)*(uint64_t*)((uint8_t*)(blk + 1) + blk_size(blk)));
         abort();
     }
 
-    g_stats.num_frees++;
-    g_stats.current_usage -= blk_size(blk);
-    fl_insert(blk);                          // marks blk as free
+    // Double-free detection (covers my_realloc's internal free path).
+    if (blk->magic == MAGIC_FREE) {
+        fprintf(stderr, "[my_malloc] DOUBLE FREE at %p\n", ptr);
+        abort();
+    }
+    blk->magic = MAGIC_FREE;
 
-    // ── selective coalescing ──────────────────────────────────────────────
-    // Small/medium class blocks (< COALESCE_THRESHOLD) are intentionally NOT
-    // coalesced: keeping them in their exact-size free lists enables O(1) reuse
-    // on the next same-size allocation, avoiding a split-on-every-reallocation
-    // penalty.  Larger blocks still coalesce to allow splitting for varied sizes.
+    __atomic_fetch_add(&g_stats.num_frees,     1,            __ATOMIC_RELAXED);
+    __atomic_fetch_sub(&g_stats.current_usage, blk_size(blk), __ATOMIC_RELAXED);
+
+    // mmap blocks are returned to the OS directly; no free-list insertion.
+    if (blk_mmap(blk)) {
+        size_t total = sizeof(block_meta) + blk_size(blk) + CANARY_SIZE;
+        g_stats.num_munmap_calls++;
+        munmap(blk, total);   // blk is invalid after this point
+        return;
+    }
+
+    fl_insert(blk);
+
     if (get_size_class(blk_size(blk)) < COALESCE_THRESHOLD) return;
 
-    // ── coalesce with physical successor ─────────────────────────────────
     block_meta* nxt = blk->heap_next;
     if (nxt && blk_free(nxt)) {
         fl_remove(nxt);
@@ -232,7 +353,6 @@ void my_free(void* ptr) {
         g_stats.num_coalesces++;
     }
 
-    // ── coalesce with physical predecessor ───────────────────────────────
     block_meta* prv = blk->heap_prev;
     if (prv && blk_free(prv)) {
         fl_remove(prv);
@@ -247,35 +367,138 @@ void my_free(void* ptr) {
     }
 }
 
+// ── public API (every entry point holds g_heap_lock for its full duration) ─
+
+void* my_malloc(size_t size) {
+    if (size == 0) return nullptr;
+    size_t aligned = ALIGN(size);
+
+    // TLS fast path: small, non-mmap classes only.
+    if (aligned < MMAP_THRESHOLD) {
+        int cls = get_size_class(aligned);
+        if (cls < TCACHE_MAX_CLASS) {
+            TCache::Bin& bin = tls_cache.bins[cls];
+            if (bin.head) {
+                block_meta* blk = bin.head;
+                bin.head = blk->free_next;
+                blk->free_next = blk->free_prev = nullptr;
+                bin.count--;
+                blk->magic = MAGIC_ALLOC;
+                record_alloc(blk_size(blk));
+                return (void*)(blk + 1);
+            }
+        }
+    }
+
+    // Slow path: lock, call into full allocator.
+    pthread_mutex_lock(&g_heap_lock);
+    void* p = malloc_unlocked(size);
+    pthread_mutex_unlock(&g_heap_lock);
+    return p;
+}
+
+void my_free(void* ptr) {
+    if (!ptr) return;
+
+    block_meta* blk = (block_meta*)ptr - 1;
+
+    // Canary check: no lock needed — the caller owns this block.
+    if (!check_canary(blk)) {
+        fprintf(stderr,
+                "[my_malloc] HEAP CORRUPTION at %p (blk_size=%zu): canary overwritten "
+                "(expected 0x%016llX, got 0x%016llX)\n",
+                ptr, blk_size(blk),
+                (unsigned long long)CANARY_VALUE,
+                (unsigned long long)*(uint64_t*)((uint8_t*)(blk + 1) + blk_size(blk)));
+        abort();
+    }
+
+    // Double-free detection.
+    if (blk->magic == MAGIC_FREE) {
+        fprintf(stderr, "[my_malloc] DOUBLE FREE at %p\n", ptr);
+        abort();
+    }
+
+    // mmap blocks bypass the free list entirely.
+    if (blk_mmap(blk)) {
+        blk->magic = MAGIC_FREE;
+        __atomic_fetch_add(&g_stats.num_frees,     1,            __ATOMIC_RELAXED);
+        __atomic_fetch_sub(&g_stats.current_usage, blk_size(blk), __ATOMIC_RELAXED);
+        size_t total = sizeof(block_meta) + blk_size(blk) + CANARY_SIZE;
+        pthread_mutex_lock(&g_heap_lock);
+        g_stats.num_munmap_calls++;
+        pthread_mutex_unlock(&g_heap_lock);
+        munmap(blk, total);
+        return;
+    }
+
+    int cls = get_size_class(blk_size(blk));
+
+    // TLS fast path: small no-coalesce classes.
+    if (cls < TCACHE_MAX_CLASS) {
+        blk->magic = MAGIC_FREE;
+        __atomic_fetch_add(&g_stats.num_frees,     1,            __ATOMIC_RELAXED);
+        __atomic_fetch_sub(&g_stats.current_usage, blk_size(blk), __ATOMIC_RELAXED);
+        TCache::Bin& bin = tls_cache.bins[cls];
+        if (bin.count >= TCACHE_BIN_MAX)
+            tls_cache.flush_bin(cls, TCACHE_BIN_MAX / 2);
+        blk->free_next = bin.head;
+        blk->free_prev = nullptr;
+        bin.head = blk;
+        bin.count++;
+        return;
+    }
+
+    // Slow path: coalescing/large classes go through the global heap lock.
+    pthread_mutex_lock(&g_heap_lock);
+    free_unlocked(ptr);
+    pthread_mutex_unlock(&g_heap_lock);
+}
+
 void* my_realloc(void* ptr, size_t size) {
+    // Delegate edge cases to the public functions (they acquire the lock).
     if (!ptr)    return my_malloc(size);
     if (size == 0) { my_free(ptr); return nullptr; }
+
+    pthread_mutex_lock(&g_heap_lock);
 
     size = ALIGN(size);
     block_meta* blk = (block_meta*)ptr - 1;
 
-    if (blk_size(blk) == size) return ptr;
-
-    if (blk_size(blk) > size) {
-        // Shrink in place — move canary to new offset.
-        g_stats.current_usage -= (blk_size(blk) - size);
-        blk_set_size_used(blk, size);
-        write_canary(blk);
+    if (blk_size(blk) == size) {
+        pthread_mutex_unlock(&g_heap_lock);
         return ptr;
     }
 
-    // Grow: allocate, copy, free.
-    void* new_ptr = my_malloc(size);
-    if (!new_ptr) return nullptr;
-    memcpy(new_ptr, ptr, blk_size(blk));
-    my_free(ptr);
+    if (blk_size(blk) > size) {
+        // Shrink in place; preserve the mmap flag if present.
+        __atomic_fetch_sub(&g_stats.current_usage, blk_size(blk) - size, __ATOMIC_RELAXED);
+        blk_set_size_used_keep_flags(blk, size);
+        write_canary(blk);
+        pthread_mutex_unlock(&g_heap_lock);
+        return ptr;
+    }
+
+    // Grow: allocate new, copy, free old — all under the same lock acquisition
+    // to avoid a window where another thread could observe a dangling ptr.
+    size_t old_size = blk_size(blk);
+    void*  new_ptr  = malloc_unlocked(size);
+    if (!new_ptr) {
+        pthread_mutex_unlock(&g_heap_lock);
+        return nullptr;
+    }
+    memcpy(new_ptr, ptr, old_size);
+    free_unlocked(ptr);
+    pthread_mutex_unlock(&g_heap_lock);
     return new_ptr;
 }
 
 void* my_calloc(size_t num, size_t size) {
     size_t total = num * size;
     if (num != 0 && total / num != size) return nullptr;  // overflow
-    void* ptr = my_malloc(total);
+    pthread_mutex_lock(&g_heap_lock);
+    void* ptr = malloc_unlocked(total);
+    pthread_mutex_unlock(&g_heap_lock);
     if (ptr) memset(ptr, 0, total);
     return ptr;
 }
@@ -283,6 +506,8 @@ void* my_calloc(size_t num, size_t size) {
 // ── heap dump ──────────────────────────────────────────────────────────────
 
 void my_heap_dump() {
+    pthread_mutex_lock(&g_heap_lock);
+
     printf("%-4s  %-18s  %-10s  %-5s  %-6s\n",
            "#", "block addr", "data size", "class", "status");
     printf("----  ------------------  ----------  -----  ------\n");
@@ -311,21 +536,34 @@ void my_heap_dump() {
         if (cnt) printf("  class %d (max %5zu B): %d block(s)\n",
                         i, CLASS_MAX[i] == (size_t)-1 ? (size_t)0 : CLASS_MAX[i], cnt);
     }
+
+    pthread_mutex_unlock(&g_heap_lock);
 }
 
 // ── stats dump ─────────────────────────────────────────────────────────────
 
-const alloc_stats* my_get_stats() { return &g_stats; }
+const alloc_stats* my_get_stats() {
+    // Returns a pointer to the live struct; the caller must not hold the lock
+    // while dereferencing it across a yield point.  Safe for single-threaded
+    // use and for the test harness which calls it between allocations.
+    return &g_stats;
+}
 
 void my_stats_dump() {
+    pthread_mutex_lock(&g_heap_lock);
+    alloc_stats snap = g_stats;               // copy under lock, print outside
+    pthread_mutex_unlock(&g_heap_lock);
+
     printf("=== Allocator Statistics ===\n");
-    printf("  Allocations       : %zu\n",   g_stats.num_allocs);
-    printf("  Frees             : %zu\n",   g_stats.num_frees);
-    printf("  Total allocated   : %zu B\n", g_stats.total_allocated);
-    printf("  Current usage     : %zu B\n", g_stats.current_usage);
-    printf("  Peak usage        : %zu B\n", g_stats.peak_usage);
-    printf("  Splits            : %zu\n",   g_stats.num_splits);
-    printf("  Coalesces         : %zu\n",   g_stats.num_coalesces);
-    printf("  sbrk calls        : %zu\n",   g_stats.num_sbrk_calls);
-    printf("  Wilderness saves  : %zu\n",   g_stats.num_wilderness_saves);
+    printf("  Allocations       : %zu\n",   snap.num_allocs);
+    printf("  Frees             : %zu\n",   snap.num_frees);
+    printf("  Total allocated   : %zu B\n", snap.total_allocated);
+    printf("  Current usage     : %zu B\n", snap.current_usage);
+    printf("  Peak usage        : %zu B\n", snap.peak_usage);
+    printf("  Splits            : %zu\n",   snap.num_splits);
+    printf("  Coalesces         : %zu\n",   snap.num_coalesces);
+    printf("  sbrk calls        : %zu\n",   snap.num_sbrk_calls);
+    printf("  Wilderness saves  : %zu\n",   snap.num_wilderness_saves);
+    printf("  mmap calls        : %zu\n",   snap.num_mmap_calls);
+    printf("  munmap calls      : %zu\n",   snap.num_munmap_calls);
 }

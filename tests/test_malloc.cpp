@@ -205,16 +205,17 @@ TEST(splitting_fires_on_large_reuse) {
 }
 
 TEST(wilderness_fires_on_tail_extension) {
-    // Use sizes that far exceed any residual free block.
-    const size_t S1 = 1024 * 1024;         // 1 MB
-    const size_t S2 = 2 * 1024 * 1024;   // 2 MB
+    // Use sizes below MMAP_THRESHOLD so both allocations go through the sbrk
+    // heap and exercise the wilderness extension path.
+    const size_t S1 = 64  * 1024;   //  64 KB — below MMAP_THRESHOLD
+    const size_t S2 = 100 * 1024;   // 100 KB — below MMAP_THRESHOLD, > S1
 
     char* tail = (char*)my_malloc(S1);
     EXPECT(tail != nullptr);
-    my_free(tail);  // heap_tail is now a free 4 MB block
+    my_free(tail);  // heap_tail is now a free sbrk block
 
     auto before = snap();
-    char* ext = (char*)my_malloc(S2);  // S2 > S1 → wilderness extends tail
+    char* ext = (char*)my_malloc(S2);  // S2 > S1 → wilderness must extend
     EXPECT(ext != nullptr);
     EXPECT(DELTA(num_wilderness_saves, before) >= 1u);
     my_free(ext);
@@ -275,6 +276,20 @@ TEST(canary_corruption_triggers_abort) {
     EXPECT(aborted);
 }
 
+TEST(double_free_triggers_abort) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        char* p = (char*)my_malloc(16);
+        my_free(p);   // first free: OK
+        my_free(p);   // double free: should abort
+        _exit(0);     // unreachable
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    bool aborted = WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    EXPECT(aborted);
+}
+
 TEST(large_allocation_and_free) {
     // Stress: many large allocations.
     const int N = 16;
@@ -285,6 +300,32 @@ TEST(large_allocation_and_free) {
         EXPECT(is_aligned(ptrs[i]));
     }
     for (int i = 0; i < N; i++) my_free(ptrs[i]);
+}
+
+TEST(mmap_large_alloc_bypasses_heap) {
+    // Allocations >= MMAP_THRESHOLD must increment num_mmap_calls and
+    // be returned to the OS on free (num_munmap_calls).  They must also
+    // be properly aligned and writable.
+    auto before = snap();
+
+    const size_t BIG = MMAP_THRESHOLD;          // exactly at threshold
+    char* p = (char*)my_malloc(BIG);
+    EXPECT(p != nullptr);
+    EXPECT(is_aligned(p));
+    EXPECT_EQ(DELTA(num_mmap_calls, before), 1u);
+
+    memset(p, 0xAB, BIG);
+    for (size_t i = 0; i < BIG; i++) EXPECT((uint8_t)p[i] == 0xAB);
+
+    my_free(p);
+    EXPECT_EQ(DELTA(num_munmap_calls, before), 1u);
+
+    // A sub-threshold allocation must NOT increment mmap counters.
+    auto before2 = snap();
+    void* q = my_malloc(MMAP_THRESHOLD - 8);
+    EXPECT(q != nullptr);
+    EXPECT_EQ(DELTA(num_mmap_calls, before2), 0u);
+    my_free(q);
 }
 
 TEST(mixed_size_interleaved) {
@@ -344,6 +385,10 @@ int main() {
 
     section("Guard banding");
     RUN(canary_corruption_triggers_abort);
+    RUN(double_free_triggers_abort);
+
+    section("mmap");
+    RUN(mmap_large_alloc_bypasses_heap);
 
     section("Stress");
     RUN(large_allocation_and_free);

@@ -7,8 +7,16 @@
 #define ALIGNMENT    8
 #define ALIGN(size)  (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
 
-#define CANARY_VALUE  ((uint64_t)0xDEADBEEFDEADBEEFULL)
-#define CANARY_SIZE   sizeof(uint64_t)
+#define CANARY_VALUE     ((uint64_t)0xDEADBEEFDEADBEEFULL)
+#define CANARY_SIZE      sizeof(uint64_t)
+
+// Magic values stored in block_meta::magic for double-free detection.
+#define MAGIC_ALLOC      ((uint64_t)0xA110CA7ED00DBEEFULL)  // block is live
+#define MAGIC_FREE       ((uint64_t)0xF4EEF4EEF4EEF4EEULL)  // block is on a free list / TLS cache
+
+// Requests at or above this threshold bypass sbrk and use mmap/munmap so
+// that freed large blocks are returned to the OS immediately.
+#define MMAP_THRESHOLD   (128 * 1024)   // 128 KB
 
 #define NUM_CLASSES  12
 #define LARGE_CLASS  (NUM_CLASSES - 1)
@@ -29,28 +37,35 @@ static const size_t CLASS_MAX[NUM_CLASSES] = {
 
 // Block metadata sits immediately before every user allocation.
 // Memory layout:
-//   [ block_meta (40 B) ][ user payload (size B) ][ canary (8 B) ]
+//   [ block_meta (48 B) ][ user payload (size B) ][ canary (8 B) ]
 //
-// Packing: the free flag is stored in bit 0 of the 'size' field.
-// This is safe because ALIGNMENT == 8, so all user sizes are multiples of 8
-// and bit 0 is otherwise always zero.  The size_class field is dropped and
-// recomputed on demand via get_size_class(), which is a short linear scan.
-// Net saving: 8 B per block (48 B → 40 B) improving cache density.
+// Packing: status flags are stored in the low bits of the 'size' field.
+//   bit 0 : free flag  (1 = block is on a free list)
+//   bit 1 : mmap flag  (1 = block was obtained via mmap, not sbrk)
+// Both flags are safe because ALIGNMENT == 8, so all user sizes are
+// multiples of 8 and bits 0–2 are otherwise always zero.
 typedef struct block_meta {
-    struct block_meta* heap_next;  // next block in physical heap order
-    struct block_meta* heap_prev;  // prev block in physical heap order
+    struct block_meta* heap_next;  // next block in physical heap order (sbrk only)
+    struct block_meta* heap_prev;  // prev block in physical heap order (sbrk only)
     struct block_meta* free_next;  // next in segregated free list
     struct block_meta* free_prev;  // prev in segregated free list
-    size_t size;   // bits [3..]: aligned user payload; bit 0: free flag
+    size_t    size;                // bits [3..]: aligned user payload; bit 0: free; bit 1: mmap
+    uint64_t  magic;               // MAGIC_ALLOC when live, MAGIC_FREE when freed
 } block_meta;
 
 // Packed-field accessors — all callers must use these instead of blk->size.
-static inline size_t blk_size(const block_meta* b) { return b->size & ~(size_t)1; }
+static inline size_t blk_size(const block_meta* b) { return b->size & ~(size_t)3; }
 static inline bool   blk_free(const block_meta* b) { return (b->size & 1) != 0; }
-// Set both size and flag together (avoids two writes).
-static inline void   blk_set_size_used(block_meta* b, size_t s) { b->size = s;      }
-static inline void   blk_set_size_free(block_meta* b, size_t s) { b->size = s | 1;  }
-// Toggle flag only, preserving the size bits.
+static inline bool   blk_mmap(const block_meta* b) { return (b->size & 2) != 0; }
+// Set size + flags together (avoids partial writes).
+static inline void   blk_set_size_used(block_meta* b, size_t s) { b->size = s;         }
+static inline void   blk_set_size_free(block_meta* b, size_t s) { b->size = s | 1;     }
+static inline void   blk_set_size_mmap(block_meta* b, size_t s) { b->size = s | 2;     }
+// Shrink helpers that preserve the mmap flag.
+static inline void   blk_set_size_used_keep_flags(block_meta* b, size_t s) {
+    b->size = s | (b->size & 2);   // keep mmap flag, clear free flag
+}
+// Toggle free flag only, preserving size and mmap bits.
 static inline void   blk_mark_used(block_meta* b) { b->size &= ~(size_t)1; }
 
 // Global allocator statistics.
@@ -62,8 +77,10 @@ typedef struct alloc_stats {
     size_t num_frees;             // total my_free calls
     size_t num_splits;            // large block splits performed
     size_t num_coalesces;         // merge operations performed
-    size_t num_sbrk_calls;        // times the OS was asked for more memory
+    size_t num_sbrk_calls;        // times the OS was asked for more memory (sbrk)
     size_t num_wilderness_saves;  // times the free tail block was extended/reused
+    size_t num_mmap_calls;        // large allocations served via mmap
+    size_t num_munmap_calls;      // large blocks returned to OS via munmap
 } alloc_stats;
 
 void*              my_malloc(size_t size);
