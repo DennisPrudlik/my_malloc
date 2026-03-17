@@ -6,10 +6,10 @@
 
 // ── globals ────────────────────────────────────────────────────────────────
 
-static block_meta*  heap_head             = nullptr;
-static block_meta*  heap_tail             = nullptr;
+static block_meta*  heap_head              = nullptr;
+static block_meta*  heap_tail              = nullptr;
 static block_meta*  free_lists[NUM_CLASSES] = {};
-static alloc_stats  g_stats               = {};
+static alloc_stats  g_stats                = {};
 
 // ── size class helpers ─────────────────────────────────────────────────────
 
@@ -22,17 +22,18 @@ static int get_size_class(size_t size) {
 // ── canary helpers ─────────────────────────────────────────────────────────
 
 static void write_canary(block_meta* blk) {
-    *(uint64_t*)((uint8_t*)(blk + 1) + blk->size) = CANARY_VALUE;
+    *(uint64_t*)((uint8_t*)(blk + 1) + blk_size(blk)) = CANARY_VALUE;
 }
 
 static bool check_canary(const block_meta* blk) {
-    return *(const uint64_t*)((const uint8_t*)(blk + 1) + blk->size) == CANARY_VALUE;
+    return *(const uint64_t*)((const uint8_t*)(blk + 1) + blk_size(blk)) == CANARY_VALUE;
 }
 
 // ── doubly-linked free list operations ────────────────────────────────────
 
 static void fl_insert(block_meta* blk) {
-    int cls = blk->size_class;
+    int cls = get_size_class(blk_size(blk));
+    blk->size |= 1;                          // mark free (bit 0)
     blk->free_next = free_lists[cls];
     blk->free_prev = nullptr;
     if (free_lists[cls])
@@ -41,7 +42,7 @@ static void fl_insert(block_meta* blk) {
 }
 
 static void fl_remove(block_meta* blk) {
-    int cls = blk->size_class;
+    int cls = get_size_class(blk_size(blk));
     if (blk->free_prev)
         blk->free_prev->free_next = blk->free_next;
     else
@@ -67,10 +68,8 @@ static block_meta* request_block(size_t size) {
     block_meta* blk = (block_meta*)sbrk(0);
     if (sbrk(sizeof(block_meta) + size + CANARY_SIZE) == (void*)-1)
         return nullptr;
-    blk->size       = size;
-    blk->size_class = get_size_class(size);
-    blk->free       = false;
-    blk->free_next  = blk->free_prev = nullptr;
+    blk_set_size_used(blk, size);            // size stored, free flag = 0
+    blk->free_next = blk->free_prev = nullptr;
     heap_append(blk);
     write_canary(blk);
     g_stats.num_sbrk_calls++;
@@ -82,13 +81,11 @@ static block_meta* request_block(size_t size) {
 static block_meta* split_or_take(block_meta* blk, size_t size) {
     fl_remove(blk);
 
-    if (blk->size >= size + CANARY_SIZE + sizeof(block_meta) + ALIGNMENT) {
-        size_t leftover = blk->size - size - CANARY_SIZE - sizeof(block_meta);
+    if (blk_size(blk) >= size + CANARY_SIZE + sizeof(block_meta) + ALIGNMENT) {
+        size_t leftover = blk_size(blk) - size - CANARY_SIZE - sizeof(block_meta);
         block_meta* rest = (block_meta*)((uint8_t*)(blk + 1) + size + CANARY_SIZE);
-        rest->size       = leftover;
-        rest->size_class = get_size_class(leftover);
-        rest->free       = true;
-        rest->free_next  = rest->free_prev = nullptr;
+        blk_set_size_free(rest, leftover);   // leftover size + free flag
+        rest->free_next = rest->free_prev = nullptr;
 
         rest->heap_prev = blk;
         rest->heap_next = blk->heap_next;
@@ -96,56 +93,66 @@ static block_meta* split_or_take(block_meta* blk, size_t size) {
         else                heap_tail = rest;
         blk->heap_next = rest;
 
-        blk->size       = size;
-        blk->size_class = get_size_class(size);
-
+        blk_set_size_used(blk, size);        // exact size, free flag cleared
         write_canary(blk);
         write_canary(rest);
         fl_insert(rest);
         g_stats.num_splits++;
     }
     // If no split: block may be larger than 'size' (internal fragmentation).
-    // size_class is corrected by the caller; canary stays at blk->size.
+    // Canary stays at blk_size(blk); caller (my_malloc) marks the block used.
     return blk;
 }
 
 static block_meta* fl_find(int cls, size_t size) {
-    // 1. Exact small/medium class — O(1) pop (all blocks are CLASS_MAX[cls]).
+    // 1. Exact small/medium class — O(1) pop.
+    //    All blocks in a small/medium class have the same capacity (CLASS_MAX[cls]),
+    //    so any block from that list satisfies the request without a size check.
+    //    LARGE_CLASS blocks have variable sizes and must not be popped blindly.
     if (cls < LARGE_CLASS && free_lists[cls]) {
         block_meta* blk = free_lists[cls];
         fl_remove(blk);
         return blk;
     }
 
-    // 2. Large class — first-fit with splitting.
-    //    Also serves small-class requests whose exact list is empty (coalesced blocks
-    //    land here and can be split back into the needed size).
+    // 2. Search upward through intermediate classes (added 4096/8192 classes
+    //    mean there are now splittable blocks between cls and LARGE_CLASS).
+    for (int c = cls + 1; c < LARGE_CLASS; c++) {
+        if (free_lists[c])
+            return split_or_take(free_lists[c], size);
+    }
+
+    // 3. LARGE_CLASS — first-fit with splitting.
     for (block_meta* blk = free_lists[LARGE_CLASS]; blk; blk = blk->free_next) {
-        if (blk->size >= size)
+        if (blk_size(blk) >= size)
             return split_or_take(blk, size);
     }
     return nullptr;
 }
 
 // ── wilderness (top-of-heap) optimization ─────────────────────────────────
-// If the last heap block is free, extend it in-place instead of sbrk-ing a
-// whole new chunk.  Returns the (still free) tail block on success.
 
 static block_meta* try_wilderness(size_t size) {
-    if (!heap_tail || !heap_tail->free) return nullptr;
+    if (!heap_tail || !blk_free(heap_tail)) return nullptr;
 
     block_meta* tail = heap_tail;
 
-    // Extend the tail block if it's too small.
-    if (tail->size < size) {
-        size_t deficit = size - tail->size;
-        if (sbrk(deficit) == (void*)-1) return nullptr;
-        tail->size = size;
+    if (blk_size(tail) < size) {
+        // Remove from the free list BEFORE changing the size.  fl_remove uses
+        // get_size_class(blk_size(tail)) to locate the right list; updating
+        // tail->size first would cause it to look in the wrong class, leaving a
+        // dangling pointer in the old list and allowing double-allocation.
+        fl_remove(tail);
+        size_t deficit = size - blk_size(tail);
+        if (sbrk(deficit) == (void*)-1) {
+            fl_insert(tail);                 // restore: extension failed
+            return nullptr;
+        }
+        blk_set_size_free(tail, size);       // safe to update size now
+        fl_insert(tail);                     // re-insert under the new class
         g_stats.num_sbrk_calls++;
     }
 
-    // split_or_take handles both the split and the fl_remove.
-    // It may update heap_tail if a remainder is created.
     block_meta* blk = split_or_take(tail, size);
     g_stats.num_wilderness_saves++;
     return blk;
@@ -168,8 +175,6 @@ void* my_malloc(size_t size) {
     size = ALIGN(size);
 
     int cls = get_size_class(size);
-    // Round small requests up to the canonical class size so every block in a
-    // small class has identical capacity (enabling O(1) free-list pop).
     if (cls < LARGE_CLASS) size = CLASS_MAX[cls];
 
     block_meta* blk = fl_find(cls, size);
@@ -180,10 +185,9 @@ void* my_malloc(size_t size) {
 
     if (!blk) return nullptr;
 
-    blk->free       = false;
-    blk->size_class = cls;
-    write_canary(blk);
-    record_alloc(blk->size);
+    blk_set_size_used(blk, size);            // pin to requested size + clear free flag
+    write_canary(blk);                       // canary lands at user+size, not at a larger block's offset
+    record_alloc(size);
     return (void*)(blk + 1);
 }
 
@@ -199,25 +203,30 @@ void my_free(void* ptr) {
                 "(expected 0x%016llX, got 0x%016llX)\n",
                 ptr,
                 (unsigned long long)CANARY_VALUE,
-                (unsigned long long)*(uint64_t*)((uint8_t*)(blk + 1) + blk->size));
+                (unsigned long long)*(uint64_t*)((uint8_t*)(blk + 1) + blk_size(blk)));
         abort();
     }
 
     g_stats.num_frees++;
-    g_stats.current_usage -= blk->size;
-    blk->free = true;
-    fl_insert(blk);
+    g_stats.current_usage -= blk_size(blk);
+    fl_insert(blk);                          // marks blk as free
+
+    // ── selective coalescing ──────────────────────────────────────────────
+    // Small/medium class blocks (< COALESCE_THRESHOLD) are intentionally NOT
+    // coalesced: keeping them in their exact-size free lists enables O(1) reuse
+    // on the next same-size allocation, avoiding a split-on-every-reallocation
+    // penalty.  Larger blocks still coalesce to allow splitting for varied sizes.
+    if (get_size_class(blk_size(blk)) < COALESCE_THRESHOLD) return;
 
     // ── coalesce with physical successor ─────────────────────────────────
     block_meta* nxt = blk->heap_next;
-    if (nxt && nxt->free) {
+    if (nxt && blk_free(nxt)) {
         fl_remove(nxt);
         fl_remove(blk);
-        blk->size      += CANARY_SIZE + sizeof(block_meta) + nxt->size;
-        blk->heap_next  = nxt->heap_next;
+        blk_set_size_free(blk, blk_size(blk) + CANARY_SIZE + sizeof(block_meta) + blk_size(nxt));
+        blk->heap_next = nxt->heap_next;
         if (nxt->heap_next) nxt->heap_next->heap_prev = blk;
         else                heap_tail = blk;
-        blk->size_class = get_size_class(blk->size);
         write_canary(blk);
         fl_insert(blk);
         g_stats.num_coalesces++;
@@ -225,14 +234,13 @@ void my_free(void* ptr) {
 
     // ── coalesce with physical predecessor ───────────────────────────────
     block_meta* prv = blk->heap_prev;
-    if (prv && prv->free) {
+    if (prv && blk_free(prv)) {
         fl_remove(prv);
         fl_remove(blk);
-        prv->size      += CANARY_SIZE + sizeof(block_meta) + blk->size;
-        prv->heap_next  = blk->heap_next;
+        blk_set_size_free(prv, blk_size(prv) + CANARY_SIZE + sizeof(block_meta) + blk_size(blk));
+        prv->heap_next = blk->heap_next;
         if (blk->heap_next) blk->heap_next->heap_prev = prv;
         else                heap_tail = prv;
-        prv->size_class = get_size_class(prv->size);
         write_canary(prv);
         fl_insert(prv);
         g_stats.num_coalesces++;
@@ -246,13 +254,12 @@ void* my_realloc(void* ptr, size_t size) {
     size = ALIGN(size);
     block_meta* blk = (block_meta*)ptr - 1;
 
-    if (blk->size == size) return ptr;
+    if (blk_size(blk) == size) return ptr;
 
-    if (blk->size > size) {
+    if (blk_size(blk) > size) {
         // Shrink in place — move canary to new offset.
-        g_stats.current_usage -= (blk->size - size);
-        blk->size       = size;
-        blk->size_class = get_size_class(size);
+        g_stats.current_usage -= (blk_size(blk) - size);
+        blk_set_size_used(blk, size);
         write_canary(blk);
         return ptr;
     }
@@ -260,7 +267,7 @@ void* my_realloc(void* ptr, size_t size) {
     // Grow: allocate, copy, free.
     void* new_ptr = my_malloc(size);
     if (!new_ptr) return nullptr;
-    memcpy(new_ptr, ptr, blk->size);
+    memcpy(new_ptr, ptr, blk_size(blk));
     my_free(ptr);
     return new_ptr;
 }
@@ -280,22 +287,23 @@ void my_heap_dump() {
            "#", "block addr", "data size", "class", "status");
     printf("----  ------------------  ----------  -----  ------\n");
 
-    int    n          = 0;
-    size_t total      = 0;
-    size_t live       = 0;
+    int    n     = 0;
+    size_t total = 0;
+    size_t live  = 0;
 
     for (block_meta* b = heap_head; b; b = b->heap_next, n++) {
+        size_t sz  = blk_size(b);
+        int    cls = get_size_class(sz);
         printf("%-4d  %-18p  %-10zu  %-5d  %s\n",
-               n, (void*)b, b->size, b->size_class, b->free ? "FREE" : "USED");
-        total += b->size;
-        if (!b->free) live += b->size;
+               n, (void*)b, sz, cls, blk_free(b) ? "FREE" : "USED");
+        total += sz;
+        if (!blk_free(b)) live += sz;
     }
 
     printf("----  ------------------  ----------  -----  ------\n");
     printf("total %zu B across %d block(s) — %zu live, %zu free\n\n",
            total, n, live, total - live);
 
-    // Per-class free list summary.
     printf("Free lists:\n");
     for (int i = 0; i < NUM_CLASSES; i++) {
         int cnt = 0;
