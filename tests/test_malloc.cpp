@@ -179,10 +179,12 @@ TEST(free_and_reuse_same_class) {
 }
 
 TEST(coalescing_reduces_block_count) {
+    // LARGE_CLASS sizes (> CLASS_MAX[LARGE_CLASS-1] = 65536) bypass TLS so
+    // blocks land on the global free list where coalescing is checked.
     auto before = snap();
-    char* a = (char*)my_malloc(4096);
-    char* b = (char*)my_malloc(4096);
-    char* c = (char*)my_malloc(4096);
+    char* a = (char*)my_malloc(70000);
+    char* b = (char*)my_malloc(70000);
+    char* c = (char*)my_malloc(70000);
     EXPECT(a && b && c);
     my_free(a);
     my_free(c);
@@ -191,34 +193,50 @@ TEST(coalescing_reduces_block_count) {
 }
 
 TEST(splitting_fires_on_large_reuse) {
-    char* big = (char*)my_malloc(8192);
+    // Use LARGE_CLASS sizes so the blocks bypass TLS and go through the global
+    // free-list path.  A 100 KB block freed then reallocated as 70 KB must split.
+    char* big = (char*)my_malloc(100000);
     EXPECT(big != nullptr);
     my_free(big);
 
     auto before = snap();
-    char* s1 = (char*)my_malloc(512);
-    char* s2 = (char*)my_malloc(512);
-    EXPECT(s1 && s2);
+    char* s1 = (char*)my_malloc(70000);  // reuses and splits the 100 KB block
+    EXPECT(s1 != nullptr);
     EXPECT(DELTA(num_splits, before) >= 1u);
     my_free(s1);
-    my_free(s2);
 }
 
 TEST(wilderness_fires_on_tail_extension) {
-    // Use sizes below MMAP_THRESHOLD so both allocations go through the sbrk
-    // heap and exercise the wilderness extension path.
-    const size_t S1 = 64  * 1024;   //  64 KB — below MMAP_THRESHOLD
-    const size_t S2 = 100 * 1024;   // 100 KB — below MMAP_THRESHOLD, > S1
+    // Previous tests leave large free blocks that fl_find would satisfy, so
+    // drain the LARGE_CLASS free list by holding allocations until a fresh
+    // sbrk call occurs (signalling the free list is now empty).
+    // Both S1 and S2 are LARGE_CLASS (> 65536 B) and below MMAP_THRESHOLD.
+    const size_t DRAIN_SZ = 70 * 1024;
+    const size_t S1 = 70 * 1024;
+    const size_t S2 = 90 * 1024;
 
+    void* drain[8] = {};
+    int   ndrain   = 0;
+    size_t sbrk0   = my_get_stats()->num_sbrk_calls;
+    while (ndrain < 8) {
+        drain[ndrain] = my_malloc(DRAIN_SZ);
+        if (!drain[ndrain]) break;
+        ndrain++;
+        if (my_get_stats()->num_sbrk_calls > sbrk0) break;  // free list exhausted
+    }
+
+    // Free list is now empty; the next alloc goes to sbrk → tail is heap_tail.
     char* tail = (char*)my_malloc(S1);
     EXPECT(tail != nullptr);
-    my_free(tail);  // heap_tail is now a free sbrk block
+    my_free(tail);  // heap_tail is now a free sbrk block of size S1
 
     auto before = snap();
     char* ext = (char*)my_malloc(S2);  // S2 > S1 → wilderness must extend
     EXPECT(ext != nullptr);
     EXPECT(DELTA(num_wilderness_saves, before) >= 1u);
     my_free(ext);
+
+    for (int i = 0; i < ndrain; i++) my_free(drain[i]);
 }
 
 TEST(stats_alloc_free_counts_match) {
@@ -261,13 +279,15 @@ TEST(stats_total_allocated_only_grows) {
 
 TEST(canary_corruption_triggers_abort) {
     // Use fork so the abort does not kill this process.
+    // Use 1024 B (class 7, fat-header path) — slab objects (≤ 512 B) have no
+    // per-object canary since their tightly-packed slots leave no room.
     pid_t pid = fork();
     if (pid == 0) {
         // Child: corrupt the canary then call my_free.
-        char* p = (char*)my_malloc(8);
-        p[8] = 0xFF;  // overwrite first byte of canary
-        my_free(p);   // should abort
-        _exit(0);     // unreachable
+        char* p = (char*)my_malloc(1024);
+        p[1024] = 0xFF;  // overwrite first byte of canary
+        my_free(p);     // should abort
+        _exit(0);       // unreachable
     }
     int status = 0;
     waitpid(pid, &status, 0);

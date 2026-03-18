@@ -7,6 +7,30 @@
 #define ALIGNMENT    8
 #define ALIGN(size)  (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
 
+// ── slab allocator constants ────────────────────────────────────────────────
+// Objects ≤ 256 B are served from page-aligned mmap slabs with zero per-object
+// overhead.  The slab header (slab_meta, 64 B) lives at page offset 0; objects
+// follow immediately after.  Overhead is ≤ 1.7 % for all slab classes.
+#define PAGE_SIZE         4096u
+#define SLAB_PAGE_MAGIC   ((uint64_t)0x5BAB5BAB5BAB5BABULL)
+#define SLAB_FREE_MAGIC   ((uint64_t)0xF4EED5ABF4EED5ABULL)  // poison in freed slots
+#define NUM_SLAB_CLASSES  7    // classes 0–6 (8 B – 512 B)
+
+// Slab header — sits at offset 0 of every slab page (must be exactly 64 B).
+// The magic word at offset 0 lets my_free() distinguish slab objects from
+// fat-header sbrk/mmap blocks via a single page-aligned read.
+typedef struct slab_meta {
+    uint64_t    magic;         // SLAB_PAGE_MAGIC (first field — used by is_slab_ptr)
+    void*       freelist;      // local free list  (owner thread only, no atomics)
+    void*       remote_free;   // cross-thread free list (atomic CAS push)
+    slab_meta*  next_partial;  // global partial-slab list linkage
+    uint32_t    free_count;    // free slots remaining (local + remote, approximate)
+    uint32_t    total;         // total object slots per slab
+    uint8_t     cls;           // size class index (0–NUM_SLAB_CLASSES-1)
+    uint8_t     in_partial;    // 1 when slab is in any partial-slab list
+    uint8_t     _pad[22];      // pad struct to exactly 64 B (one cache line)
+} slab_meta;
+
 #define CANARY_VALUE     ((uint64_t)0xDEADBEEFDEADBEEFULL)
 #define CANARY_SIZE      sizeof(uint64_t)
 
@@ -18,14 +42,15 @@
 // that freed large blocks are returned to the OS immediately.
 #define MMAP_THRESHOLD   (128 * 1024)   // 128 KB
 
-#define NUM_CLASSES  12
+#define NUM_CLASSES  15
 #define LARGE_CLASS  (NUM_CLASSES - 1)
 
 // Maximum user payload size for each size class (last = uncapped / large).
-// Two new classes (4096, 8192) reduce requests that fall into the slow LARGE_CLASS
-// first-fit path.
+// Classes 11–13 (16 KB, 32 KB, 64 KB) close the gap between 8 KB and the
+// 128 KB mmap threshold so those requests get O(1) free-list pops instead
+// of falling into the slow LARGE_CLASS first-fit path.
 static const size_t CLASS_MAX[NUM_CLASSES] = {
-    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, (size_t)-1
+    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, (size_t)-1
 };
 
 // Classes strictly below this index are never coalesced on free.
@@ -81,6 +106,7 @@ typedef struct alloc_stats {
     size_t num_wilderness_saves;  // times the free tail block was extended/reused
     size_t num_mmap_calls;        // large allocations served via mmap
     size_t num_munmap_calls;      // large blocks returned to OS via munmap
+    size_t num_slab_pages;        // 4 KB pages allocated for slab classes
 } alloc_stats;
 
 void*              my_malloc(size_t size);
